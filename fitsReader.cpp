@@ -4,6 +4,7 @@
 // Reads fits files using cfitsio (https://heasarc.gsfc.nasa.gov/docs/software/fitsio/fitsio.html)
 
 #include <fitsio.h>
+#undef TBYTE // Fix overlap with windows type name
 #include "DDImage/DDWindows.h"
 #include "DDImage/Reader.h"
 #include "DDImage/Row.h"
@@ -50,7 +51,7 @@ fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(
 		iop->error("Error getting image parameters: %s", errStr);
 		return;
 	}
-    int bitpix, naxis;
+	int bitpix, naxis;
 	long naxes[2] = {1,1};
 	if (fits_get_img_param(fptr, 2, &bitpix, &naxis, naxes, &status)) {
 		std::cout << "Error getting image parameters: ";

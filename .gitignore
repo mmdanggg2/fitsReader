@@ -1,2 +1,5 @@
 fitsReader.os
 fitsReader.so
+/x64
+/fitsReader.vcxproj.user
+/fitsReader.vcxproj.filters
