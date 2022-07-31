@@ -13,11 +13,26 @@
 #include "DDImage/LUT.h"
 
 using namespace DD::Image;
+using std::vector;
+using std::map;
+using std::string;
+
+struct hduImageInfo {
+	int hduIndex;
+	char name[70] = {};
+	string chName;
+	
+	int bpp;
+	int nDims;
+	long size[3] = {1,1,1};
+};
+
 
 class fitsReader : public Reader {
 	Lock lock;
 	fitsfile* fptr = nullptr;
 	int status = 0;
+	map<Channel, hduImageInfo> hduImageList;
 public:
 	fitsReader(Read*, int fd, const unsigned char* b, int n);
 	~fitsReader();
@@ -38,34 +53,91 @@ static Reader* build(Read* iop, int fd, const unsigned char* b, int n) {
 
 const Reader::Description fitsReader::d("fits\0", "fits file reader", build, test);
 
+// Prints the current fits error message to cout
+// if iop is not null, it will be used to display the error message in nuke
+// clears the error status unless clearStatus is false
+void printFitsError(const char* msg, int* status, Iop* iop, bool clearStatus = true) {
+	std::cout << msg << ": ";
+	fits_report_error(stdout, *status);
+
+	if (iop) {
+		char errStr[31] = {};
+		fits_get_errstatus(*status, errStr);
+		iop->error("%s: %s", msg, errStr);
+	}
+	if (clearStatus) {
+		*status = 0;
+	}
+}
+
 fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(r) {
 	// Make it default to linear colorspace:
 	lut_ = LUT::GetLut(LUT::FLOAT, this);
 	
 	std::cout << "Reading in FITS file: " << r->filename() << std::endl;
-	if (fits_open_image(&fptr, r->filename(), READONLY, &status)) {
-		std::cout << "Error reading file: ";
-		fits_report_error(stdout, status);
-		char errStr[31] = {};
-		fits_get_errstatus(status, errStr);
-		iop->error("Error getting image parameters: %s", errStr);
+	if (fits_open_file(&fptr, r->filename(), READONLY, &status)) {
+		printFitsError("Error reading file", &status, iop);
 		return;
 	}
-	int bitpix, naxis;
-	long naxes[2] = {1,1};
-	if (fits_get_img_param(fptr, 2, &bitpix, &naxis, naxes, &status)) {
-		std::cout << "Error getting image parameters: ";
-		fits_report_error(stdout, status);
-		char errStr[31] = {};
-		fits_get_errstatus(status, errStr);
-		iop->error("Error getting image parameters: %s", errStr);
+	
+	int hduCount;
+	if (fits_get_num_hdus(fptr, &hduCount, &status)) {
+		printFitsError("Error getting number of hdu's in file", &status, iop);
 		return;
 	}
-	std::cout << "bpp: " << bitpix << std::endl;
-	std::cout << "naxis: " << naxis << std::endl;
-	std::cout << "Width: " << naxes[0] << std::endl;
-	std::cout << "Height: " << naxes[1] << std::endl;
-	set_info(naxes[0], naxes[1], 1);
+	std::cout << "Number of HDUs: " << hduCount << std::endl;
+	
+	ChannelSet channels = ChannelSet();
+	
+	for (int i = 1; i <= hduCount; i++) {
+		int hduType;
+		if (fits_movabs_hdu(fptr, i, &hduType, &status)) {
+			printFitsError("Error moving to hdu", &status, iop);
+			continue;
+		}
+			
+		/*/char* hdrText;
+		int nKeys;
+		if (fits_hdr2str(fptr, 0, nullptr, 0, &hdrText, &nKeys, &status)) {
+			printFitsError("Error reading header", &status, nullptr);
+			continue;
+		}
+		std::cout << "Header: " << std::endl << hdrText << std::endl;//*/
+
+		if (hduType == IMAGE_HDU) {
+			std::cout << "Found image hdu at " << i << std::endl;
+			hduImageInfo info = {};
+			info.hduIndex = i;
+			if (fits_read_key(fptr, TSTRING, "EXTNAME", info.name, nullptr, &status)) {
+				printFitsError("Error reading EXTNAME", &status, nullptr);
+				continue;
+			}
+			std::cout << "name: " << info.name << std::endl;
+			info.chName = info.name;
+			if (fits_get_img_param(fptr, 3, &info.bpp, &info.nDims, info.size, &status)) {
+				printFitsError("Error getting image parameters", &status, iop);
+				continue;
+			}
+			std::cout << "bpp: " << info.bpp << std::endl;
+			std::cout << "naxis: " << info.nDims << std::endl;
+			std::cout << "Width: " << info.size[0] << std::endl;
+			std::cout << "Height: " << info.size[1] << std::endl;
+			if (info.nDims != 2) {
+				std::cout << "Image not 2D, ignoring..." << std::endl;
+				continue;
+			}
+			Channel ch = getChannel(info.chName.append(".r").c_str());
+			channels += ch;
+			hduImageList[ch] = info;
+		}
+	}
+	auto infoPair = hduImageList.begin();
+	hduImageInfo info = infoPair->second;
+	if (fits_movabs_hdu(fptr, info.hduIndex, nullptr, &status)) {
+		printFitsError("Error moving to hdu", &status, iop);
+	}
+	set_info(info.size[0], info.size[1], 1);
+	info_.channels(channels);
 }
 
 fitsReader::~fitsReader() {
@@ -80,16 +152,24 @@ void fitsReader::open() {
 }
 
 // The engine reads individual rows out of the input.
-void fitsReader::engine(int y, int x, int xr, ChannelMask channels, Row& row) {
+void fitsReader::engine(int y, int x, int xr, ChannelMask chans, Row& row) {
 	long startLoc[2] = {x+1, y+1};
-	float* writeable = row.writable(Chan_Red);
-	
-	lock.lock();
 	float nan = NAN;
-	if (fits_read_pix(fptr, TFLOAT, startLoc, xr-x, &nan, writeable, NULL, &status)) {
-		std::cout << "Error reading image pixels: ";
-		fits_report_error(stdout, status);
+	
+	foreach(ch, chans) {
+		int wasNulls = 0;
+		hduImageInfo info = hduImageList[ch];
+		lock.lock();
+		if (fits_movabs_hdu(fptr, info.hduIndex, nullptr, &status)) {
+			printFitsError("Error moving to hdu", &status, iop);
+			continue;
+		}
+		float* writeable = row.writable(ch);
+		
+		if (fits_read_pix(fptr, TFLOAT, startLoc, xr-x, &nan, writeable, &wasNulls, &status)) {
+			printFitsError("Error reading image pixels", &status, iop);
+		}
+		lock.unlock();
 	}
 	
-	lock.unlock();
 }
