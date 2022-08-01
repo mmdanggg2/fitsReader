@@ -73,6 +73,7 @@ void printFitsError(const char* msg, int* status, Iop* iop, bool clearStatus = t
 fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(r) {
 	// Make it default to linear colorspace:
 	lut_ = LUT::GetLut(LUT::FLOAT, this);
+	set_info(1, 1, 1);// fallback res, shows our error rather than did not set bounds
 	
 	std::cout << "Reading in FITS file: " << r->filename() << std::endl;
 	if (fits_open_file(&fptr, r->filename(), READONLY, &status)) {
@@ -88,6 +89,7 @@ fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(
 	std::cout << "Number of HDUs: " << hduCount << std::endl;
 	
 	ChannelSet channels = ChannelSet();
+	int maxFrame = 0;
 	
 	for (int i = 1; i <= hduCount; i++) {
 		int hduType;
@@ -110,7 +112,7 @@ fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(
 			info.hduIndex = i;
 			if (fits_read_key(fptr, TSTRING, "EXTNAME", info.name, nullptr, &status)) {
 				printFitsError("Error reading EXTNAME", &status, nullptr);
-				continue;
+				strncpy_s(info.name, string("IMAGE_").append(std::to_string(i)).c_str(), 70);
 			}
 			std::cout << "name: " << info.name << std::endl;
 			info.chName = info.name;
@@ -122,8 +124,11 @@ fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(
 			std::cout << "naxis: " << info.nDims << std::endl;
 			std::cout << "Width: " << info.size[0] << std::endl;
 			std::cout << "Height: " << info.size[1] << std::endl;
-			if (info.nDims != 2) {
-				std::cout << "Image not 2D, ignoring..." << std::endl;
+			std::cout << "Depth: " << info.size[2] << std::endl;
+			if (info.nDims == 3) {
+				maxFrame = std::max(maxFrame, (int)info.size[2]);
+			} else if (info.nDims != 2) {
+				std::cout << "Image not 2D or 3D, ignoring..." << std::endl;
 				continue;
 			}
 			Channel ch = getChannel(info.chName.append(".r").c_str());
@@ -131,13 +136,18 @@ fitsReader::fitsReader(Read* r, int fd, const unsigned char* b, int n) : Reader(
 			hduImageList[ch] = info;
 		}
 	}
-	auto infoPair = hduImageList.begin();
-	hduImageInfo info = infoPair->second;
-	if (fits_movabs_hdu(fptr, info.hduIndex, nullptr, &status)) {
-		printFitsError("Error moving to hdu", &status, iop);
+	if (hduImageList.empty()) {
+		iop->error("No valid image HDUs found in file!");
+		return;
 	}
-	set_info(info.size[0], info.size[1], 1);
+	
+	auto mainInfoPair = hduImageList.begin();
+	hduImageInfo mainInfo = mainInfoPair->second;
+	set_info(mainInfo.size[0], mainInfo.size[1], 1);
 	info_.channels(channels);
+	
+	info_.setFirstFrame(1);
+	info_.setLastFrame(maxFrame);
 }
 
 fitsReader::~fitsReader() {
@@ -153,12 +163,15 @@ void fitsReader::open() {
 
 // The engine reads individual rows out of the input.
 void fitsReader::engine(int y, int x, int xr, ChannelMask chans, Row& row) {
-	long startLoc[2] = {x+1, y+1};
+	long startLoc[3] = {x+1, y+1, 1};
 	float nan = NAN;
 	
 	foreach(ch, chans) {
 		int wasNulls = 0;
 		hduImageInfo info = hduImageList[ch];
+		if (info.nDims == 3) {
+			startLoc[2] = std::max(std::min(frame(), (int)info.size[2]), 1);
+		}
 		lock.lock();
 		if (fits_movabs_hdu(fptr, info.hduIndex, nullptr, &status)) {
 			printFitsError("Error moving to hdu", &status, iop);
